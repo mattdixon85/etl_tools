@@ -1,0 +1,57 @@
+
+As Data Scientists we prefer our data to be a vector, perhaps with a target variable to accompany it.  Most data is stored in data warehouses in raw form, or even perhaps it has been processed by some colleagues however it remains in an unsuitable state.  Therefore we need to transform this data into our feature vectors.  This is a time-consuming, arduous process when one often has to surrender granularity for the sake of getting a finished feature vector.  Additionally when revisiting the code as part of the iterative modelling process we may not have made it easy for ourselves to easily extend the existing ETL process to accomodate more features.  We are often frustrated with our ETL processes because they force us to write slow jobs which hinder the iterative process, sometimes we end up copying great swathes of data because there's no easy way to easily add in the extra feature so we end up making multiple passes over the same dataset, doing 99% the same operation as before.  Other times we get bogged down in the issue of dealing with time - windowed counts, adding future values to be our target metrics, avoiding leaks from the future.  All of this makes the ETL process complicated and time-consuming.  Even if we do end up with a feature-set close to our original vision its often the case that the code is difficult for others to understand, has incurred code-duplication or is extremely sensitive to changes by others.
+
+What the centricities repo offers is the ability to deal with some of these issues so long as your data satisfies some (or all) of the following assumptions:
+
+    - it is sufficiently complex that it would benefit from complex feature extraction
+    - it includes a common key that you could use to link all of it together meaningfully
+    - it includes a timestamp which you could use to order it sequentially
+    - it is an event stream or many event streams, but is not audio or speech
+    - for any one entity is small relative to the total size of your data
+    
+Data Scientists often work in collaborative environments, on problems which are complicated, and which change over time.  As a result probems are tackled by more than one Data Scientist, possibly not at the same time.  Given the likely complex nature of the problem it is advantageous for these individuals to share code such that the second Data Scientist can continue where the first left off.  But no-one likes inheriting bad code and we often find ourselves rewriting ETL processes just because its easier than unpicking others.  In an ideal world there would be standard ways of applying ETL to common data structures like event streams, no matter what the domain or the problem.  Much how Machine Learning libraries encapsulate complicated algorithms into function calls it would be great if the ETL process could be reduced to a function call, perhaps with a set of parameters.
+
+There are a few components to this, namely:
+    - defining a common interface.  We have already stated that we'd like a feature vector output, which is standard input for many ML algorithms, what should our equivalent input be to an ETL 'function'?
+    - defining common operations.  If there existed a common ETL process then there would have to be common operations that one would apply, so what can we think of that we might expect to need across different problems?
+    
+
+Common Interface - Shape
+
+The first aspect of the common interface to decide is shape.  Coming from an Analyst background it is tempting to join data together on fields, however I find in practice this causes problems.  We often dont want to perform just equality joining on a key, but also using an inequality expression by comparing the timestamps of either side, perhaps taking all data on one side ocurring before the other.  Even if the DB does support this type of join and even if it scales (hint: it doesn't scale) then we are still faced with the issue of cartesian product, which must be anticipated by the writer.  Further it prevents us from joining additional datasets together until the cartesian product from the first join has been processed.  This means that several issues occur at once - we must process the data linearly, without access to other datasets besides the 2 in question, unless we go through additional prior joins.  In either case the amount of code to be written can quickly explode.  Once this happens the idea of the code being sharable becomes tenuous.  My feeling is that as much as possible one should avoid joining tables together and should instead leverage UNION ALL queries instead.  This is where the requirement of a common key across your data becomes important.
+
+Take the following example, I have 3 censors, A, B and C producing data which comes with a key, a timestamp and some custom data unique to the censor.  It is possible for a key to appear on one, two or all of the censors however no one sensor includes all the keys seen globally.  Given this, write a query which joins the data together:
+
+    select coalesce(a_or_b.key, c.key) as key, a_or_b.foo, a_or_b.bar, c.bas
+    from (
+        select coalesce(a.key,b.key) as key, a.foo, b.bar
+        from a
+          full join b using (key)
+    ) as a_or_b
+      full join c using (key)
+
+This is messy but it just about works.  What if I now told you I have 20 more censors?  This results in 23 separate joins which must be executed in serial.  What if I also told you to leverage the timestamp column so that your output includes a dimension of time?  Clearly joining is not going to result in a shareable piece of code.  This is why I like UNION ALL since it makes no assumption about what data one entity may reside within.  However it does not deal with the difference in schema, for this reason the Centricity class expects an unstructured component to the common interface wherein feed-specific info can be declared.  Obviously performing a UNION ALL query does not actually do anything with the data, but it is a much simpler way of passing the data to the next component of the the common ETL process...
+
+Common Interface - Delivery
+
+The second aspect of the common interface is how we deliver this shape of data.  Should we pass all of it at once?  Likely this wouldn't scale, especially if problems change and we needed to include more data than we did before.  At the very least we would need to pass all data for a single entity to the function at once.  Further, given our predilection for an awareness of time we may want to feed this data in strictly in chronological order.  This means we can quite naturally process the data cumulatively, over windows of time and without having to worry about leaks from the future (provided the timestamps are correct and adhere to the same time zone).  It turns out there are some easy tricks for including those pesky target variables which occurred in future too, and its dead-easy to avoid leaks from the future.  However I'll cover this later.
+
+
+Common Operations
+
+We've now defined the way data flows into our ETL 'function' or processor (we'll send a stream of time-ordered data) however we need to now address the idea of common operations.  The current version of the Centricity class can calculate the following kinds of features given your stream:
+
+    - count instances of a particular event occurring since the beginning of the stream
+    - sum the numeric value of a field within the unstructured component of a particular event(s)
+    - measure the amount of time that has passed since a particular event last occurred (returns a negative one if the event has never occurred)
+    
+These 3 types of metrics have variants which include additional constraints or automation such as:
+    - a particular field(s) in the unstructured component equalling a certain value
+    - limiting to events falling within a rolling window, either relative to the output feature vector time or since the last time it occurred
+    - collecting large maps over variants of possible values
+    
+There is a final dimension to the feature-vector generation which is when and how often to generate these feature vectors.  Possible options include:
+
+    - once the stream has finished
+    - for each input record
+    - when a provided timestamp begins or passes
